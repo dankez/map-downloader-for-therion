@@ -11,9 +11,17 @@ export interface MapSettings {
   maxConcurrency: number;
 }
 
-export interface Layer {
+export interface LayerConfig {
   id: string;
-  type: 'freemap' | 'terrain2' | 'geology' | 'ortofoto';
+  nameKey: string; // Using string to avoid circular dependencies with translations.ts
+  type: 'xyz' | 'wms';
+  urlPattern: string;
+  maxZoom?: number;
+}
+
+export interface Layer {
+  id: string; // Unique ID for React key, e.g., 'l123'
+  sourceId: string; // ID of the layer config, e.g., 'freemap'
 }
 
 export interface DownloadProgress {

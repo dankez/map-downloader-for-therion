@@ -1,4 +1,3 @@
-
 export const translations = {
   sk: {
     title: 'DankeZ downloader',
@@ -29,6 +28,9 @@ export const translations = {
     layerTerrain2: 'Tieneny relief old',
     layerGeology: 'Geologická Mapa SR',
     layerOrtofoto: 'Ortofoto Mapa',
+    layerZbgis: 'ZBGIS Základná Mapa',
+    layerZbgisTeren: 'ZBGIS Terén',
+    layerZbgisOrto: 'ZBGIS Ortofoto',
     opacity: 'Priehľadnosť',
     addLayer: '(+) Pridať vrstvu',
     totalTiles: 'Počet dlaždíc na mape:',
@@ -118,6 +120,9 @@ export const translations = {
     layerTerrain2: 'Shaded Relief (Old)',
     layerGeology: 'Geological Map SK',
     layerOrtofoto: 'Orthophoto Map',
+    layerZbgis: 'ZBGIS Base Map',
+    layerZbgisTeren: 'ZBGIS Terrain',
+    layerZbgisOrto: 'ZBGIS Orthophoto',
     opacity: 'Opacity',
     addLayer: '(+) Add Layer',
     totalTiles: 'Total Tiles on Map:',

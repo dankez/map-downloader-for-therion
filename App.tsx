@@ -1,6 +1,7 @@
 import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import type { MapSettings, DownloadProgress, AppStatus, Layer } from './types';
 import { translations, TranslationKey } from './translations';
+import { layerSources } from './sources';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import JSZip from 'jszip';
@@ -87,21 +88,28 @@ const tileToBbox = (x: number, y: number, zoom: number): string => {
     return `${mercator_min.x},${mercator_min.y},${mercator_max.x},${mercator_max.y}`;
 };
 
-const getOriginalTileUrlForLayer = (layer: Layer, zoom: number, x: number, y: number): string => {
-    switch (layer.type) {
-        case 'freemap':
-            return `https://sk-hires-shading.tiles.freemap.sk/${zoom}/${x}/${y}.jpg`;
-        case 'terrain2':
-            return `https://dmr5-shading.tiles.freemap.sk/${zoom}/${x}/${y}.jpg`;
-        case 'geology':
-            const bbox = tileToBbox(x, y, zoom);
-            return `https://ags.geology.sk/arcgis/services/WebServices/GM50/MapServer/WMSServer?service=WMS&request=GetMap&layers=0%2C1%2C2&styles=&format=image%2Fjpeg&transparent=false&version=1.3.0&width=256&height=256&crs=EPSG%3A3857&bbox=${bbox}`;
-        case 'ortofoto':
-            return `https://ortofoto.tiles.freemap.sk/${zoom}/${x}/${y}.jpg`;
-        default:
-             return '';
+const getTileUrl = (sourceId: string, zoom: number, x: number, y: number): string => {
+    const source = layerSources.find(s => s.id === sourceId);
+    if (!source) {
+        console.error(`Source config not found for id: ${sourceId}`);
+        return '';
     }
+
+    // Handle max zoom by clamping to the source's maxZoom if it exists
+    const effectiveZoom = source.maxZoom ? Math.min(zoom, source.maxZoom) : zoom;
+
+    let url = source.urlPattern
+        .replace('{z}', String(effectiveZoom))
+        .replace('{x}', String(x))
+        .replace('{y}', String(y));
+
+    if (source.type === 'wms') {
+        const bbox = tileToBbox(x, y, effectiveZoom);
+        url = url.replace('{bbox}', bbox);
+    }
+    return url;
 };
+
 
 const PROXIES = [
     (url: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
@@ -240,7 +248,7 @@ const App: React.FC = () => {
         maxConcurrency: 5,
     });
     const [layers, setLayers] = useState<Layer[]>([
-        { id: 'l1', type: 'freemap' },
+        { id: 'l1', sourceId: 'zbgis_teren' },
     ]);
     const [layerBlend, setLayerBlend] = useState(100);
     const [status, setStatus] = useState<AppStatus>('idle');
@@ -252,6 +260,8 @@ const App: React.FC = () => {
     const [kmlFileName, setKmlFileName] = useState<string>('');
     const [kmlSettings, setKmlSettings] = useState({ color: '#ff0000', width: 2, opacity: 1 });
     const [isReStitching, setIsReStitching] = useState(false);
+    const [sidebarWidth, setSidebarWidth] = useState(450);
+    const isResizing = useRef(false);
 
     const imageRef = useRef<HTMLImageElement>(null);
     const isInitialSuccessRender = useRef(true);
@@ -396,11 +406,11 @@ const App: React.FC = () => {
     };
     
     const downloadTile = useCallback(async (x: number, y: number, layer: Layer, attempt = 1, proxyIndex = -1): Promise<Blob> => {
-        const cacheKey = `${layer.type}_${mapSettings.zoom}_${x}_${y}`;
+        const cacheKey = `${layer.sourceId}_${mapSettings.zoom}_${x}_${y}`;
         const cached = await TileCache.get(cacheKey);
         if (cached) return cached;
 
-        const originalUrl = getOriginalTileUrlForLayer(layer, mapSettings.zoom, x, y);
+        const originalUrl = getTileUrl(layer.sourceId, mapSettings.zoom, x, y);
         let url = originalUrl;
         
         if (proxyIndex > -1) {
@@ -460,7 +470,7 @@ const App: React.FC = () => {
                     const blobUrl = URL.createObjectURL(blob);
                     setTileData(prev => ({ ...prev, [tileKey]: { ...prev[tileKey], status: 'success', blob, blobUrl } }));
                 } catch (e) {
-                    console.error(`Failed to download tile ${x}, ${y} for layer ${layer.type}:`, e);
+                    console.error(`Failed to download tile ${x}, ${y} for layer ${layer.sourceId}:`, e);
                     setTileData(prev => ({ ...prev, [tileKey]: { ...prev[tileKey], status: 'failed' } }));
                 } finally {
                     completed++;
@@ -499,7 +509,7 @@ const App: React.FC = () => {
     };
 
     const addLayer = () => {
-        const newLayer: Layer = { id: `l${Date.now()}`, type: 'freemap' };
+        const newLayer: Layer = { id: `l${Date.now()}`, sourceId: 'zbgis_teren' };
         setLayers(prev => {
             if (prev.length >= 1) {
                 setLayerBlend(50);
@@ -615,9 +625,42 @@ const App: React.FC = () => {
         );
     }, [kmlPaths, tileGrid, cornerCoords, mapSettings.zoom, finalWidth, finalHeight, kmlSettings, layers.length]);
 
+    const handleMouseDown = (e: React.MouseEvent) => {
+        e.preventDefault();
+        isResizing.current = true;
+        document.body.style.cursor = 'col-resize';
+        document.addEventListener('mousemove', handleMouseMove);
+        document.addEventListener('mouseup', handleMouseUp);
+    };
+
+    const handleMouseMove = useCallback((e: MouseEvent) => {
+        if (!isResizing.current) return;
+        setSidebarWidth(prevWidth => {
+            const newWidth = e.clientX;
+            if (newWidth >= 350 && newWidth <= 800) {
+                return newWidth;
+            }
+            return prevWidth;
+        });
+    }, []);
+
+    const handleMouseUp = useCallback(() => {
+        isResizing.current = false;
+        document.body.style.cursor = 'default';
+        document.removeEventListener('mousemove', handleMouseMove);
+        document.removeEventListener('mouseup', handleMouseUp);
+    }, [handleMouseMove]);
+
+    useEffect(() => {
+        return () => {
+            document.removeEventListener('mousemove', handleMouseMove);
+            document.removeEventListener('mouseup', handleMouseUp);
+        };
+    }, [handleMouseMove, handleMouseUp]);
+
 
     const renderSettings = () => (
-        <div className="w-full lg:w-96 bg-gray-950 p-4 space-y-6 overflow-y-auto h-full flex flex-col">
+        <div className="w-full bg-gray-950 p-4 space-y-6 overflow-y-auto h-full flex flex-col">
             <div>
                 <h1 className="text-2xl font-bold">{t('title')}</h1>
                 <p className="text-sm text-gray-400">{t('subtitle')}</p>
@@ -651,7 +694,7 @@ const App: React.FC = () => {
                             </div>
                             <div>
                                 <label className="text-sm block">{t('zoomLevel')}</label>
-                                <input type="range" name="zoom" min="1" max="18" value={mapSettings.zoom} onChange={handleSettingsChange} className="w-full"/>
+                                <input type="range" name="zoom" min="1" max="19" value={mapSettings.zoom} onChange={handleSettingsChange} className="w-full"/>
                                 <span className="text-center block text-sm">{mapSettings.zoom}</span>
                             </div>
                         </div>
@@ -678,18 +721,17 @@ const App: React.FC = () => {
                                <div key={layer.id} className="bg-gray-900 p-2 rounded-md">
                                   <div className="flex items-center justify-between">
                                       <select
-                                        value={layer.type}
+                                        value={layer.sourceId}
                                         onChange={(e) => {
                                             const newLayers = [...layers];
-                                            newLayers[index].type = e.target.value as Layer['type'];
+                                            newLayers[index].sourceId = e.target.value;
                                             setLayers(newLayers);
                                         }}
                                         className="bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-sm"
                                        >
-                                         <option value="freemap">{t('layerFreemap')}</option>
-                                         <option value="terrain2">{t('layerTerrain2')}</option>
-                                         <option value="geology">{t('layerGeology')}</option>
-                                         <option value="ortofoto">{t('layerOrtofoto')}</option>
+                                         {layerSources.map(source => (
+                                             <option key={source.id} value={source.id}>{t(source.nameKey as TranslationKey)}</option>
+                                         ))}
                                       </select>
                                       {layers.length > 1 && (
                                         <button onClick={() => setLayers(layers.filter(l => l.id !== layer.id))} className="text-red-500 hover:text-red-400 text-xl font-bold">&times;</button>
@@ -833,7 +875,7 @@ const App: React.FC = () => {
                                                             <img 
                                                                 src={data.blobUrl} 
                                                                 className="w-full h-full object-cover" 
-                                                                alt={`Tile ${x}, ${y} Layer ${layer.type}`} 
+                                                                alt={`Tile ${x}, ${y} Layer ${layer.sourceId}`} 
                                                             />
                                                         )}
                                                         {index === 0 && baseLayerData?.status === 'loading' && <div className="animate-pulse bg-gray-700/50 w-full h-full absolute inset-0"></div>}
@@ -884,8 +926,16 @@ const App: React.FC = () => {
 
     return (
         <div className="flex flex-col lg:flex-row h-screen bg-gray-900 text-white font-sans">
-            {renderSettings()}
-            <main className="flex-grow flex items-center justify-center bg-gray-850/50">
+            <aside style={{ width: `${sidebarWidth}px` }} className="flex-shrink-0 h-full">
+                {renderSettings()}
+            </aside>
+            <div
+                onMouseDown={handleMouseDown}
+                className="w-2 h-full cursor-col-resize bg-gray-800 hover:bg-blue-600 transition-colors duration-200 flex-shrink-0"
+                aria-label="Resize sidebar"
+                role="separator"
+            />
+            <main className="flex-grow flex items-center justify-center bg-gray-850/50 overflow-hidden">
                 {renderContent()}
             </main>
         </div>
