@@ -1,0 +1,5 @@
+{
+  "name": "Freemap Tile Downloader for Therion",
+  "description": "A web application to download and stitch map tiles from Freemap.sk based on GPS coordinates, zoom level, and a specified radius for cavers using Therion. ",
+  "requestFramePermissions": []
+}
