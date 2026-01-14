@@ -5,6 +5,8 @@ import { ortofoto } from './ortofoto';
 import { zbgis } from './zbgis';
 import { zbgisTeren } from './zbgis_teren';
 import { zbgisOrto } from './zbgis_orto';
+import { historical } from './historical';
+import { gnOrtofoto } from './gn_ortofoto';
 import type { LayerConfig } from '../types';
 
 export const layerSources: LayerConfig[] = [
@@ -15,4 +17,6 @@ export const layerSources: LayerConfig[] = [
   zbgis,
   zbgisTeren,
   zbgisOrto,
+  historical,
+  gnOrtofoto,
 ];

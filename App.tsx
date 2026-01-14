@@ -1,3 +1,4 @@
+
 import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import type { MapSettings, DownloadProgress, AppStatus, Layer } from './types';
 import { translations, TranslationKey } from './translations';
@@ -5,6 +6,12 @@ import { layerSources } from './sources';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import JSZip from 'jszip';
+import proj4 from 'proj4';
+
+
+// S-JTSK Coordinate System Definition for proj4
+proj4.defs('EPSG:5514', '+proj=krovak +lat_0=49.5 +lon_0=24.83333333333333 +alpha=30.28813972222222 +k=0.9999 +x_0=0 +y_0=0 +ellps=bessel +towgs84=570.8,85.7,462.8,4.998,1.587,5.261,3.56 +units=m +no_defs');
+proj4.defs('EPSG:4326', '+proj=longlat +datum=WGS84 +no_defs');
 
 
 const TILE_SIZE = 256;
@@ -65,59 +72,6 @@ const TileCache = {
 
 // --- Coordinate & Tile URL Logic ---
 
-const lonLatToMercator = (lon: number, lat: number): { x: number, y: number } => {
-    const x = lon * 20037508.34 / 180;
-    let y = Math.log(Math.tan((90 + lat) * Math.PI / 360)) / (Math.PI / 180);
-    y = y * 20037508.34 / 180;
-    return { x, y };
-};
-
-const tileToBbox = (x: number, y: number, zoom: number): string => {
-    const n = Math.pow(2, zoom);
-    const lon_min = (x / n) * 360 - 180;
-    const lat_rad_max = Math.atan(Math.sinh(Math.PI * (1 - 2 * y / n)));
-    const lat_max = lat_rad_max * 180 / Math.PI;
-
-    const lon_max = ((x + 1) / n) * 360 - 180;
-    const lat_rad_min = Math.atan(Math.sinh(Math.PI * (1 - 2 * (y + 1) / n)));
-    const lat_min = lat_rad_min * 180 / Math.PI;
-
-    const mercator_min = lonLatToMercator(lon_min, lat_min);
-    const mercator_max = lonLatToMercator(lon_max, lat_max);
-
-    return `${mercator_min.x},${mercator_min.y},${mercator_max.x},${mercator_max.y}`;
-};
-
-const getTileUrl = (sourceId: string, zoom: number, x: number, y: number): string => {
-    const source = layerSources.find(s => s.id === sourceId);
-    if (!source) {
-        console.error(`Source config not found for id: ${sourceId}`);
-        return '';
-    }
-
-    // Handle max zoom by clamping to the source's maxZoom if it exists
-    const effectiveZoom = source.maxZoom ? Math.min(zoom, source.maxZoom) : zoom;
-
-    let url = source.urlPattern
-        .replace('{z}', String(effectiveZoom))
-        .replace('{x}', String(x))
-        .replace('{y}', String(y));
-
-    if (source.type === 'wms') {
-        const bbox = tileToBbox(x, y, effectiveZoom);
-        url = url.replace('{bbox}', bbox);
-    }
-    return url;
-};
-
-
-const PROXIES = [
-    (url: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-    (url: string) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
-    (url: string) => `https://api.codetabs.com/v1/proxy/?quest=${url}`,
-    (url: string) => `https://thingproxy.freeboard.io/fetch/${url}`,
-];
-
 const gpsToTile = (lat: number, lon: number, zoom: number): { x: number; y: number } => {
   const n = Math.pow(2, zoom);
   const xtile = Math.floor((lon + 180.0) / 360.0 * n);
@@ -139,6 +93,86 @@ const tileToGps = (x: number, y: number, zoom: number): { lat: number; lon: numb
     const lat = latRad * 180.0 / Math.PI;
     return { lat, lon };
 };
+
+
+const getTileUrl = (sourceId: string, zoom: number, mercatorX: number, mercatorY: number): string => {
+    const source = layerSources.find(s => s.id === sourceId);
+    if (!source) {
+        console.error(`Source config not found for id: ${sourceId}`);
+        return '';
+    }
+
+    const effectiveZoom = source.maxZoom ? Math.min(zoom, source.maxZoom) : zoom;
+
+    let x = mercatorX;
+    let y = mercatorY;
+    let z = effectiveZoom;
+
+    // Handle S-JTSK (EPSG:5514) projection
+    if (source.crs === 'EPSG:5514' && source.origin && source.resolutions) {
+        // 1. Get the center coordinates of the Web Mercator tile
+        const centerGps = tileToGps(mercatorX + 0.5, mercatorY + 0.5, zoom);
+
+        // 2. Transform GPS (WGS84) to S-JTSK coordinates
+        // Proj4 returns [Y, X] for Krovak projection, so we swap them. Y is negative.
+        const sjtskCoords = proj4('EPSG:4326', 'EPSG:5514').forward([centerGps.lon, centerGps.lat]);
+        const sjtskX = sjtskCoords[0];
+        const sjtskY = sjtskCoords[1];
+
+        // 3. Calculate TileCol and TileRow based on the S-JTSK grid definition
+        const resolution = source.resolutions[effectiveZoom];
+        if (resolution === undefined) {
+             console.error(`No resolution defined for zoom ${effectiveZoom} in source ${sourceId}`);
+             return '';
+        }
+        
+        x = Math.floor((sjtskX - source.origin[0]) / (resolution * TILE_SIZE));
+        y = Math.floor((source.origin[1] - sjtskY) / (resolution * TILE_SIZE));
+        z = effectiveZoom; // In WMTS, this is the TileMatrix
+
+    } else if (source.type === 'wms') {
+        // WMS BBOX calculation remains based on Web Mercator tiles
+        const lonLatToMercator = (lon: number, lat: number): { x: number, y: number } => {
+            const x = lon * 20037508.34 / 180;
+            let y = Math.log(Math.tan((90 + lat) * Math.PI / 360)) / (Math.PI / 180);
+            y = y * 20037508.34 / 180;
+            return { x, y };
+        };
+
+        const tileToBbox = (x: number, y: number, zoom: number): string => {
+            const n = Math.pow(2, zoom);
+            const lon_min = (x / n) * 360 - 180;
+            const lat_rad_max = Math.atan(Math.sinh(Math.PI * (1 - 2 * y / n)));
+            const lat_max = lat_rad_max * 180 / Math.PI;
+
+            const lon_max = ((x + 1) / n) * 360 - 180;
+            const lat_rad_min = Math.atan(Math.sinh(Math.PI * (1 - 2 * (y + 1) / n)));
+            const lat_min = lat_rad_min * 180 / Math.PI;
+
+            const mercator_min = lonLatToMercator(lon_min, lat_min);
+            const mercator_max = lonLatToMercator(lon_max, lat_max);
+
+            return `${mercator_min.x},${mercator_min.y},${mercator_max.x},${mercator_max.y}`;
+        };
+        const bbox = tileToBbox(x, y, z);
+        return source.urlPattern.replace('{bbox}', bbox);
+    }
+    
+    // Replace placeholders for all types (XYZ, WMTS)
+    return source.urlPattern
+        .replace('{z}', String(z)) // TileMatrix for WMTS
+        .replace('{x}', String(x)) // TileCol for WMTS
+        .replace('{y}', String(y)); // TileRow for WMTS
+};
+
+
+const PROXIES = [
+    (url: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+    (url: string) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+    (url: string) => `https://api.codetabs.com/v1/proxy/?quest=${url}`,
+    (url: string) => `https://thingproxy.freeboard.io/fetch/${url}`,
+];
+
 
 const metersPerPixel = (lat: number, zoom: number): number => {
     return (2 * Math.PI * 6378137 / TILE_SIZE) * Math.cos(lat * Math.PI / 180) / Math.pow(2, zoom);
@@ -234,6 +268,20 @@ const stitchTilesToDataURL = async (
     return canvas.toDataURL('image/jpeg', 0.95);
 };
 
+// --- UI Components ---
+const CopyIcon = () => (
+    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+    </svg>
+);
+
+const CheckIcon = () => (
+    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+    </svg>
+);
+
+
 const App: React.FC = () => {
     const [lang, setLang] = useState<'sk' | 'en'>('sk');
     const [mapSettings, setMapSettings] = useState<MapSettings>({
@@ -247,6 +295,15 @@ const App: React.FC = () => {
         autoRetries: 3,
         maxConcurrency: 5,
     });
+     // State for raw coordinate input fields to allow JTSK entry
+    const [inputCoords, setInputCoords] = useState({
+        lat: String(mapSettings.lat),
+        lon: String(mapSettings.lon),
+    });
+    // State for displaying coordinate conversion info
+    const [coordInfo, setCoordInfo] = useState('');
+    const [copiedId, setCopiedId] = useState<string | null>(null);
+
     const [layers, setLayers] = useState<Layer[]>([
         { id: 'l1', sourceId: 'zbgis_teren' },
     ]);
@@ -259,7 +316,12 @@ const App: React.FC = () => {
     const [kmlPaths, setKmlPaths] = useState<{lat: number, lon: number}[][] | null>(null);
     const [kmlFileName, setKmlFileName] = useState<string>('');
     const [kmlSettings, setKmlSettings] = useState({ color: '#ff0000', width: 2, opacity: 1 });
+    const [locusSettings, setLocusSettings] = useState({ name: 'FreemapExport' });
+    const [isExportingLocus, setIsExportingLocus] = useState(false);
+    const [oruxSettings, setOruxSettings] = useState({ name: 'FreemapExport' });
+    const [isExportingOrux, setIsExportingOrux] = useState(false);
     const [isReStitching, setIsReStitching] = useState(false);
+    const [isRetrying, setIsRetrying] = useState(false);
     const [sidebarWidth, setSidebarWidth] = useState(450);
     const isResizing = useRef(false);
 
@@ -268,7 +330,80 @@ const App: React.FC = () => {
     
     useEffect(() => {
         TileCache.init().catch(console.error);
+
+        // Set initial coordinate info on load
+        const { lat, lon } = mapSettings;
+        try {
+            const [jtskX_EN, jtskY_EN] = proj4('EPSG:4326', 'EPSG:5514').forward([lon, lat]);
+            // Convert to classic JTSK (Y-South, X-West) for display
+            const jtskY_classic = -jtskX_EN;
+            const jtskX_classic = -jtskY_EN;
+            setCoordInfo(`JTSK: ${jtskY_classic.toFixed(2)} ${jtskX_classic.toFixed(2)}`);
+        } catch (error) {
+            console.error("Initial coordinate conversion error:", error);
+            setCoordInfo('Conversion error');
+        }
     }, []);
+
+    // Effect for automatic coordinate conversion (WGS84 <-> JTSK)
+    useEffect(() => {
+        const handler = setTimeout(() => {
+            // User input for Y and X
+            const userInputY = parseFloat(inputCoords.lat);
+            const userInputX = parseFloat(inputCoords.lon);
+
+            if (isNaN(userInputY) || isNaN(userInputX)) {
+                setCoordInfo('');
+                return;
+            }
+
+            // Detect if input is likely JTSK based on magnitude
+            const isJtsk = Math.abs(userInputY) > 90 || Math.abs(userInputX) > 180;
+
+            try {
+                if (isJtsk) {
+                    // JTSK to WGS84
+                    // User provides positive classic JTSK (Y-South, X-West).
+                    // proj4 EPSG:5514 expects iJTSK/Krovak East-North (Xe, Yn).
+                    // Transformation: Xe = -Yj, Yn = -Xj
+                    const proj4_X_input = -Math.abs(userInputY); // Xe = -Yj
+                    const proj4_Y_input = -Math.abs(userInputX); // Yn = -Xj
+                    
+                    const [lonWGS, latWGS] = proj4('EPSG:5514', 'EPSG:4326').forward([proj4_X_input, proj4_Y_input]);
+                    
+                    if (isFinite(latWGS) && isFinite(lonWGS)) {
+                        setMapSettings(prev => ({ ...prev, lat: latWGS, lon: lonWGS }));
+                        setCoordInfo(`WGS84: ${latWGS.toFixed(6)}, ${lonWGS.toFixed(6)}`);
+                    } else {
+                       setCoordInfo('Invalid JTSK coordinates');
+                    }
+                } else {
+                    // WGS84 to JTSK
+                    // User provides WGS84 (lat, lon)
+                    setMapSettings(prev => ({ ...prev, lat: userInputY, lon: userInputX }));
+                    // proj4 returns Krovak East-North (Xe, Yn)
+                    const [jtsk_Xe, jtsk_Yn] = proj4('EPSG:4326', 'EPSG:5514').forward([userInputX, userInputY]);
+                    
+                    if (isFinite(jtsk_Xe) && isFinite(jtsk_Yn)) {
+                        // Convert to classic positive JTSK (Yj, Xj) for display
+                        // Yj = -Xe, Xj = -Yn
+                        const jtsk_Y_classic = -jtsk_Xe;
+                        const jtsk_X_classic = -jtsk_Yn;
+                        setCoordInfo(`JTSK: ${jtsk_Y_classic.toFixed(2)} ${jtsk_X_classic.toFixed(2)}`);
+                    } else {
+                        setCoordInfo('Invalid WGS84 coordinates');
+                    }
+                }
+            } catch (error) {
+                console.error("Coordinate conversion error:", error);
+                setCoordInfo('Conversion error');
+            }
+
+        }, 500); // 500ms debounce
+
+        return () => clearTimeout(handler);
+    }, [inputCoords]);
+
 
     const t = useCallback((key: TranslationKey, vars?: { [key: string]: string | number }) => {
         let text = translations[lang][key] || translations['en'][key];
@@ -347,7 +482,8 @@ const App: React.FC = () => {
         log += `Bottom-Left (Lat, Lon): ${bl.lat.toFixed(8)}, ${bl.lon.toFixed(8)} (from tile x:${xMin}, y:${yMax + 1})\n`;
         log += `Top-Right (Lat, Lon): ${tr.lat.toFixed(8)}, ${tr.lon.toFixed(8)} (from tile x:${xMax + 1}, y:${yMin})\n\n`;
 
-        const calString = `[0 0 ${bl.lat.toFixed(8)} ${bl.lon.toFixed(8)} ${width} ${height} ${tr.lat.toFixed(8)} ${tr.lon.toFixed(8)}]`;
+        // The coordinates derived from tileToGps are WGS84 decimal degrees, hence cs lat-long.
+        const calString = `cs lat-long\nbitmap map.jpg [0 0 ${bl.lat.toFixed(8)} ${bl.lon.toFixed(8)} ${width} ${height} ${tr.lat.toFixed(8)} ${tr.lon.toFixed(8)}]`;
         log += `[Therion Calibration String]\n${calString}\n\n--- Calculation End ---`;
         
         return { tileGrid: grid, totalTiles: numX * numY, calibrationString: calString, finalWidth: width, finalHeight: height, cornerCoords: {bl, tr}, memoizedLog: log };
@@ -384,17 +520,29 @@ const App: React.FC = () => {
         }
     }, [status, cornerCoords, mapSettings, tileData, tileGrid, layers, layerBlend]);
     
-    // Effect to re-stitch when KML settings change
+    // [BUGFIX] This effect handles re-stitching when KML data/settings change, without causing an infinite loop.
     useEffect(() => {
-        const reStitchOnSettingsChange = async () => {
-            if (status !== 'success' || isInitialSuccessRender.current) {
-                isInitialSuccessRender.current = false;
-                return;
-            }
-            await triggerReStitch(kmlPaths, kmlSettings);
-        };
-        reStitchOnSettingsChange();
-    }, [kmlSettings, triggerReStitch]);
+        // Only run when in the success state.
+        if (status !== 'success') {
+            return;
+        }
+
+        // When we first enter the 'success' state, `isInitialSuccessRender.current` is true.
+        // We do nothing but flip the flag, preventing a re-stitch right after the initial stitch.
+        if (isInitialSuccessRender.current) {
+            isInitialSuccessRender.current = false;
+            return;
+        }
+        
+        // In any subsequent run of this effect (caused by kmlSettings/kmlPaths changes),
+        // `isInitialSuccessRender.current` will be false, and we trigger a re-stitch.
+        triggerReStitch(kmlPaths, kmlSettings);
+    
+    // By having status as a dependency, this effect runs when we enter success state.
+    // By having kmlSettings/kmlPaths, it runs on user changes.
+    // By excluding triggerReStitch from the dependency array of its callers, we prevent the infinite loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [status, kmlSettings, kmlPaths]);
 
 
     const handleSettingsChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
@@ -402,6 +550,14 @@ const App: React.FC = () => {
         setMapSettings(prev => ({
             ...prev,
             [name]: name === 'zoom' ? parseInt(value, 10) : parseFloat(value) || 0,
+        }));
+    };
+
+    const handleCoordInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+        const { name, value } = e.target;
+        setInputCoords(prev => ({
+            ...prev,
+            [name]: value,
         }));
     };
     
@@ -593,10 +749,198 @@ const App: React.FC = () => {
         }
     };
 
+    const handleExportLocus = async () => {
+        if (!stitchedImageURL || !cornerCoords) return;
+        setIsExportingLocus(true);
+        
+        try {
+            const zip = new JSZip();
+            const folder = zip.folder("files");
+            
+            // Fetch the blob from the Data URL
+            const response = await fetch(stitchedImageURL);
+            const imageBlob = await response.blob();
+            
+            folder?.file("map.jpg", imageBlob);
+
+            const kmlContent = `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Folder>
+    <name>Locus Map Export</name>
+    <GroundOverlay>
+      <name>${locusSettings.name}</name>
+      <Icon>
+        <href>files/map.jpg</href>
+      </Icon>
+      <LatLonBox>
+        <north>${cornerCoords.tr.lat}</north>
+        <south>${cornerCoords.bl.lat}</south>
+        <east>${cornerCoords.tr.lon}</east>
+        <west>${cornerCoords.bl.lon}</west>
+        <rotation>0</rotation>
+      </LatLonBox>
+    </GroundOverlay>
+  </Folder>
+</kml>`;
+
+            zip.file("doc.kml", kmlContent);
+            
+            const content = await zip.generateAsync({ type: "blob" });
+            const url = URL.createObjectURL(content);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${locusSettings.name}.kmz`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+
+        } catch (error) {
+            console.error("Error generating KMZ for Locus:", error);
+            alert("Export failed.");
+        } finally {
+            setIsExportingLocus(false);
+        }
+    };
+
+    const handleExportOrux = async () => {
+        if (!stitchedImageURL || !cornerCoords) return;
+        setIsExportingOrux(true);
+        
+        try {
+            const zip = new JSZip();
+            
+            // Fetch the blob from the Data URL
+            const response = await fetch(stitchedImageURL);
+            const imageBlob = await response.blob();
+            
+            // File names must match for OruxMaps to recognize the calibration
+            const safeName = oruxSettings.name.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+            const imageName = `${safeName}.jpg`;
+            const xmlName = `${safeName}.otrk2.xml`;
+            
+            zip.file(imageName, imageBlob);
+
+            // OruxMaps calibration XML
+            // Coordinates logic:
+            // Top-Left:     Lat = max (tr.lat), Lon = min (bl.lon)
+            // Top-Right:    Lat = max (tr.lat), Lon = max (tr.lon)
+            // Bottom-Right: Lat = min (bl.lat), Lon = max (tr.lon)
+            // Bottom-Left:  Lat = min (bl.lat), Lon = min (bl.lon)
+            
+            const minLat = cornerCoords.bl.lat;
+            const maxLat = cornerCoords.tr.lat;
+            const minLon = cornerCoords.bl.lon;
+            const maxLon = cornerCoords.tr.lon;
+
+            const xmlContent = `<?xml version="1.0" encoding="UTF-8"?>
+<OruxTracker xmlns="http://oruxmaps.com/x/x" versionCode="3.0">
+  <MapCalibration layers="false" layerLevel="0">
+    <MapName>${oruxSettings.name}</MapName>
+    <MapChunks xMax="1" yMax="1" img_width="${finalWidth}" img_height="${finalHeight}" />
+    <MapDimensions width="${finalWidth}" height="${finalHeight}" />
+    <MapBounds minLat="${minLat}" maxLat="${maxLat}" minLon="${minLon}" maxLon="${maxLon}" />
+    <CalibrationPoints>
+      <Point valLon="${minLon}" valLat="${maxLat}" pixelX="0" pixelY="0" />
+      <Point valLon="${maxLon}" valLat="${maxLat}" pixelX="${finalWidth}" pixelY="0" />
+      <Point valLon="${maxLon}" valLat="${minLat}" pixelX="${finalWidth}" pixelY="${finalHeight}" />
+      <Point valLon="${minLon}" valLat="${minLat}" pixelX="0" pixelY="${finalHeight}" />
+    </CalibrationPoints>
+  </MapCalibration>
+</OruxTracker>`;
+
+            zip.file(xmlName, xmlContent);
+            
+            const content = await zip.generateAsync({ type: "blob" });
+            const url = URL.createObjectURL(content);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${safeName}_orux.zip`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+
+        } catch (error) {
+            console.error("Error generating ZIP for OruxMaps:", error);
+            alert("Export failed.");
+        } finally {
+            setIsExportingOrux(false);
+        }
+    };
+
+    const handleCopy = (text: string, id: string) => {
+        navigator.clipboard.writeText(text.startsWith('JTSK:') || text.startsWith('WGS84:') ? text : calibrationString).then(() => {
+            setCopiedId(id);
+            setTimeout(() => setCopiedId(null), 2000); // Hide message after 2s
+        }).catch(err => {
+            console.error('Failed to copy text: ', err);
+        });
+    };
+
 
     const failedTiles = useMemo(() => (Object.entries(tileData) as [string, TileInfo][]).filter(([, data]) => data.status === 'failed'), [tileData]);
     const successfulTiles = useMemo(() => (Object.entries(tileData) as [string, TileInfo][]).filter(([, data]) => data.status === 'success').length, [tileData]);
     
+    const handleRetryAllFailed = useCallback(async () => {
+        if (failedTiles.length === 0 || isRetrying) return;
+    
+        setIsRetrying(true);
+        setProgress({ current: 0, total: failedTiles.length, message: t('retrying') });
+    
+        const retryQueue = failedTiles.map(([fullKey]) => {
+            const parts = fullKey.split('-');
+            const layerId = parts.pop();
+            const y = parseInt(parts.pop() || '0', 10);
+            const x = parseInt(parts.join('-'), 10);
+            const layer = layers.find(l => l.id === layerId);
+            return { x, y, layer, fullKey };
+        }).filter(item => item.layer && !isNaN(item.x) && !isNaN(item.y));
+    
+        // Reset status for tiles to be retried
+        setTileData(prev => {
+            const next = { ...prev };
+            for (const job of retryQueue) {
+                if (next[job.fullKey]) {
+                   next[job.fullKey] = { ...next[job.fullKey], status: 'pending', attempt: (next[job.fullKey].attempt || 1) + 1 };
+                }
+            }
+            return next;
+        });
+    
+        let completed = 0;
+        const totalToRetry = retryQueue.length;
+        // Use a slower method by reducing concurrency
+        const retryConcurrency = Math.max(1, Math.floor(mapSettings.maxConcurrency / 2));
+    
+        const worker = async () => {
+            while (retryQueue.length > 0) {
+                const tileJob = retryQueue.shift();
+                if (!tileJob || !tileJob.layer) continue;
+                
+                const { x, y, layer, fullKey } = tileJob;
+                
+                setTileData(prev => ({ ...prev, [fullKey]: { ...prev[fullKey], status: 'loading' } }));
+                try {
+                    const blob = await downloadTile(x, y, layer);
+                    const blobUrl = URL.createObjectURL(blob);
+                    setTileData(prev => ({ ...prev, [fullKey]: { ...prev[fullKey], status: 'success', blob, blobUrl } }));
+                } catch (e) {
+                    console.error(`Retry failed for tile ${x}, ${y} for layer ${layer.sourceId}:`, e);
+                    setTileData(prev => ({ ...prev, [fullKey]: { ...prev[fullKey], status: 'failed' } }));
+                } finally {
+                    completed++;
+                    setProgress({ current: completed, total: totalToRetry, message: t('retrying') });
+                }
+            }
+        };
+    
+        const workers = Array(retryConcurrency).fill(null).map(worker);
+        await Promise.all(workers);
+    
+        setIsRetrying(false);
+    }, [failedTiles, isRetrying, layers, mapSettings.maxConcurrency, downloadTile, t]);
+
     const kmlPreviewOverlay = useMemo(() => {
         if (!kmlPaths || !tileGrid.length || !tileGrid[0].length || !cornerCoords) return null;
         
@@ -686,12 +1030,20 @@ const App: React.FC = () => {
                         <div className="space-y-2 mt-2">
                             <div>
                                 <label className="text-sm block">{t('caveEntranceLat')}</label>
-                                <input type="number" name="lat" value={mapSettings.lat} onChange={handleSettingsChange} className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-sm"/>
+                                <input type="text" name="lat" value={inputCoords.lat} onChange={handleCoordInputChange} className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-sm"/>
                             </div>
                             <div>
                                 <label className="text-sm block">{t('caveEntranceLon')}</label>
-                                <input type="number" name="lon" value={mapSettings.lon} onChange={handleSettingsChange} className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-sm"/>
+                                <input type="text" name="lon" value={inputCoords.lon} onChange={handleCoordInputChange} className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-sm"/>
                             </div>
+                            {coordInfo && (
+                                <div className="text-xs text-center text-gray-400 p-1 bg-gray-900 rounded-md flex items-center justify-center space-x-2">
+                                    <span>{coordInfo}</span>
+                                    <button onClick={() => handleCopy(coordInfo, 'coordInfo')} className="text-gray-400 hover:text-white transition-colors">
+                                        {copiedId === 'coordInfo' ? <CheckIcon /> : <CopyIcon />}
+                                    </button>
+                                </div>
+                            )}
                             <div>
                                 <label className="text-sm block">{t('zoomLevel')}</label>
                                 <input type="range" name="zoom" min="1" max="19" value={mapSettings.zoom} onChange={handleSettingsChange} className="w-full"/>
@@ -804,6 +1156,38 @@ const App: React.FC = () => {
                         </details>
                     )}
                     
+                    {/* Locus Map Settings */}
+                    <details>
+                        <summary className="font-semibold cursor-pointer">{t('locusSettings')}</summary>
+                        <div className="space-y-2 mt-2">
+                            <div>
+                                <label className="text-sm block">{t('locusMapName')}</label>
+                                <input 
+                                    type="text" 
+                                    value={locusSettings.name} 
+                                    onChange={(e) => setLocusSettings(p => ({ ...p, name: e.target.value }))} 
+                                    className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-sm"
+                                />
+                            </div>
+                        </div>
+                    </details>
+
+                    {/* OruxMaps Settings */}
+                    <details>
+                        <summary className="font-semibold cursor-pointer">{t('oruxSettings')}</summary>
+                        <div className="space-y-2 mt-2">
+                            <div>
+                                <label className="text-sm block">{t('locusMapName')}</label>
+                                <input 
+                                    type="text" 
+                                    value={oruxSettings.name} 
+                                    onChange={(e) => setOruxSettings(p => ({ ...p, name: e.target.value }))} 
+                                    className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-sm"
+                                />
+                            </div>
+                        </div>
+                    </details>
+
                     {/* Advanced Params */}
                     <details>
                         <summary className="font-semibold cursor-pointer">{t('advancedParams')}</summary>
@@ -846,7 +1230,7 @@ const App: React.FC = () => {
                         <div className="text-center mb-4">
                             <h2 className="text-xl font-bold">{t('tilePreviewTitle')}</h2>
                             <p className="text-sm text-gray-400">{t('tilePreviewSubtitle', { successful: successfulTiles, total: totalTiles * layers.length, failed: failedTiles.length })}</p>
-                            {status === 'downloading' && (
+                            {(status === 'downloading' || isRetrying) && (
                                <div className="w-full bg-gray-700 rounded-full h-2.5 mt-2">
                                     <div className="bg-blue-600 h-2.5 rounded-full" style={{ width: `${(progress.current / progress.total) * 100}%` }}></div>
                                </div>
@@ -891,7 +1275,16 @@ const App: React.FC = () => {
                         </div>
                         <div className="flex gap-4 mt-4">
                           <button onClick={handleStartOver} className="flex-1 py-2 bg-gray-600 hover:bg-gray-500 rounded-lg font-bold">{t('startOver')}</button>
-                          <button onClick={handleStitchAndDownload} disabled={status === 'downloading'} className="flex-1 py-2 bg-green-600 hover:bg-green-500 rounded-lg font-bold disabled:bg-gray-600">{t('stitchAndDownload')}</button>
+                           {failedTiles.length > 0 && (
+                              <button 
+                                  onClick={handleRetryAllFailed} 
+                                  disabled={isRetrying || status === 'downloading'}
+                                  className="flex-1 py-2 bg-yellow-600 hover:bg-yellow-500 rounded-lg font-bold disabled:bg-gray-600 disabled:cursor-not-allowed"
+                              >
+                                  {isRetrying ? t('retrying') : t('retryAllFailed', { count: failedTiles.length })}
+                              </button>
+                          )}
+                          <button onClick={handleStitchAndDownload} disabled={status === 'downloading' || isRetrying} className="flex-1 py-2 bg-green-600 hover:bg-green-500 rounded-lg font-bold disabled:bg-gray-600">{t('stitchAndDownload')}</button>
                         </div>
                     </div>
                 );
@@ -910,12 +1303,33 @@ const App: React.FC = () => {
                             <img ref={imageRef} src={stitchedImageURL} alt="Stitched Map" className="max-w-full max-h-full block" />
                         </div>
                         <div className="bg-gray-850 p-3 rounded-lg text-sm space-y-2">
-                             <h3 className="font-semibold">{t('coordsTitle')}</h3>
-                             <p className="font-mono bg-gray-900 p-2 rounded-md break-all">{calibrationString}</p>
+                             <div className="flex justify-between items-center">
+                                <h3 className="font-semibold">{t('coordsTitle')}</h3>
+                                <button onClick={() => handleCopy(calibrationString, 'therion')} title={t('copyTooltip')} className="text-gray-400 hover:text-white p-1 rounded transition-colors">
+                                    {copiedId === 'therion' ? <CheckIcon /> : <CopyIcon />}
+                                </button>
+                            </div>
+                             <p className="font-mono bg-gray-900 p-2 rounded-md break-all whitespace-pre-wrap">{calibrationString}</p>
                         </div>
-                        <div className="flex gap-4">
+                        <div className="flex gap-4 flex-col md:flex-row">
                             <button onClick={handleStartOver} className="flex-1 py-3 bg-gray-600 hover:bg-gray-500 rounded-lg font-bold">{t('startOver')}</button>
                             <a href={stitchedImageURL} download="map.jpg" className="flex-1 text-center py-3 bg-green-600 hover:bg-green-500 rounded-lg font-bold">{t('downloadMap')}</a>
+                        </div>
+                         <div className="flex gap-4">
+                            <button 
+                                onClick={handleExportLocus} 
+                                disabled={isExportingLocus}
+                                className="flex-1 py-3 bg-blue-600 hover:bg-blue-500 rounded-lg font-bold disabled:bg-gray-600"
+                            >
+                                {isExportingLocus ? t('exportingLocus') : t('exportLocus')}
+                            </button>
+                            <button 
+                                onClick={handleExportOrux} 
+                                disabled={isExportingOrux}
+                                className="flex-1 py-3 bg-orange-600 hover:bg-orange-500 rounded-lg font-bold disabled:bg-gray-600"
+                            >
+                                {isExportingOrux ? t('exportingOrux') : t('exportOrux')}
+                            </button>
                         </div>
                     </div>
                  );

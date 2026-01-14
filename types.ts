@@ -13,10 +13,13 @@ export interface MapSettings {
 
 export interface LayerConfig {
   id: string;
-  nameKey: string; // Using string to avoid circular dependencies with translations.ts
+  nameKey: string; 
   type: 'xyz' | 'wms';
   urlPattern: string;
   maxZoom?: number;
+  crs?: 'EPSG:3857' | 'EPSG:5514'; // Coordinate Reference System
+  origin?: [number, number]; // [x, y] for the top-left corner of the tile grid
+  resolutions?: number[]; // Array of resolutions for each zoom level
 }
 
 export interface Layer {

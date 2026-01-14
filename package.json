@@ -12,7 +12,8 @@
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "three": "^0.181.0",
-    "jszip": "^3.10.1"
+    "jszip": "^3.10.1",
+    "proj4": "^2.11.0"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
